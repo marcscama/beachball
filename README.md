@@ -1,1 +1,6 @@
-# help to complete the threejs orientation data vs 3d space
+Data example: 
+X,Y,Z,Md,Date,Time,Strike,Dip,Rake
+428203.260115,4520212.352749,-2460.000000,4.000000,02/10/2023,20:08:26.75,230,80,-60
+
+X,Y,Z,Ml,Time,Strike,Dip,Rake
+428444.546543,4518324.922363,-2674.000000,3.954667,2025-03-13 00:25:02.710000+00:00,299.409500,6.409000,14.690200
