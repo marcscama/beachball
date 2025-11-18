@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Beachball viewer (Three.js) — Correzione finale Shader</title>
+<title>Beachballs Viewer</title>
 <style>
-  html,body { height:100%; margin:0; background:#e9e9e9; font-family:system-ui,Segoe UI,Roboto,Arial; }
+  html,body { height:100%; margin:0; background: linear-gradient(to bottom, #f6f6f6 0%, #d0d0d0 30%, #9a9a9a 75%, #6b6b6b 100%); font-family:system-ui,Segoe UI,Roboto,Arial; }
   #app { height:100vh; display:flex; flex-direction:column; }
   #topbar { padding:8px; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,0.06); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   #canvaswrap { flex:1; position:relative; overflow:hidden; }
   canvas { display:block; width:100%; height:100%; }
   label { font-size:13px; }
   input[type="file"] { display:inline-block; }
-  .controls { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  .controls { margin-left:auto; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
 
   #tooltip {
     position: absolute;
@@ -24,6 +24,7 @@
     font-size: 12px;
     pointer-events: none;
     line-height: 1.4;
+    z-index: 100;
   }
 </style>
 
@@ -39,15 +40,15 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <label class="info">CSV (X,Y,Z,Md,Time,Strike,Dip,Rake):</label>
+    <label class="info">CSV header= (X,Y in UTM,Z in metri negativi,Md o Ml,Date,Time o Time,Strike,Dip,Rake - case sensitive):</label>
     <input id="file" type="file" accept=".csv" />
 
     <div class="controls">
-      <label>Moltiplicatore Raggio (Md³ * X):</label>
+      <label>Moltiplicatore Raggio (Md³ × k):</label>
       <input id="radiusScale" type="range" min="0.1" max="3" step="0.05" value="1.5" />
       <span id="scaleVal">1.5</span>
 
-      <label style="margin-left:10px;"><input id="showPlanes" type="checkbox" checked /> mostra piani di faglia</label>
+      <label style="margin-left:10px;"><input id="showPlanes" type="checkbox" checked /> Piani di faglia</label>
     </div>
   </div>
 
@@ -60,7 +61,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-// --- ELEMENTI DOM ---
 const container = document.getElementById('canvaswrap');
 const fileInput = document.getElementById('file');
 const showPlanesCheckbox = document.getElementById('showPlanes');
@@ -68,37 +68,38 @@ const tooltip = document.getElementById('tooltip');
 const radiusScaleInput = document.getElementById('radiusScale');
 const scaleValSpan = document.getElementById('scaleVal');
 
-// --- VARIABILI GLOBALI ---
 let scene, camera, renderer, controls;
 let rootGroup;
 let raycaster, mouse;
+let axesGroup = null;
 
 let lastLoadedRows = [];
 let sceneCenterOffset = new THREE.Vector3(0, 0, 0);
 
 const d2r = deg => deg * Math.PI / 180;
 
-// --- INIZIALIZZAZIONE ---
 initScene();
 animate();
 
 function initScene(){
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xe9e9e9);
+  scene.background = null;
 
   const w = container.clientWidth, h = container.clientHeight;
-  camera = new THREE.PerspectiveCamera(45, w/h, 0.01, 1e7);
+  camera = new THREE.PerspectiveCamera(45, w/h, 1, 1e7);
   camera.position.set(5000, 5000, 5000);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+  renderer.sortObjects = true;
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setClearColor(0x000000, 0);
   container.appendChild(renderer.domElement);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.target.set(0,0,0);
 
-  controls.minDistance = 0.01;
+  controls.minDistance = 0.1;
   controls.maxDistance = 10000;
   controls.zoomSpeed = 10.0;
   controls.enableDamping = true;
@@ -118,121 +119,82 @@ function initScene(){
   mouse = new THREE.Vector2();
 
   renderer.domElement.addEventListener('click', onCanvasClick);
-  controls.addEventListener('start', () => {
-    tooltip.style.display = 'none';
-  });
+  controls.addEventListener('start', () => { tooltip.style.display = 'none'; });
 
   scaleValSpan.textContent = radiusScaleInput.value;
-  radiusScaleInput.addEventListener('input', () => {
-    scaleValSpan.textContent = radiusScaleInput.value;
-    updateSceneFromData();
-  });
-
-  showPlanesCheckbox.addEventListener('change', () => {
-    updateSceneFromData();
-  });
+  radiusScaleInput.addEventListener('input', () => { scaleValSpan.textContent = radiusScaleInput.value; updateSceneFromData(); });
+  showPlanesCheckbox.addEventListener('change', () => { updateSceneFromData(); });
 
   window.addEventListener('resize', onWindowResize);
 }
 
-/**
- * Funzione Vettori ENU con le correzioni angolari richieste (Strike-90, 90-Dip, -Rake).
- */
 function get_enu_vectors(strikeDeg, dipDeg, rakeDeg) {
-  // 1. Angoli Corretti
-  const phi = d2r(strikeDeg - 90.0); // Correzione Strike (da Nord -> da Est)
-  const delta = d2r(90.0 - dipDeg);  // Correzione Dip (Plunge -> Dip)
-  const lam = d2r(-rakeDeg);         // Correzione Rake (Inversione segno per convenzione)
+  const strike_rad = d2r(strikeDeg);
+  const dip_direction = d2r(strikeDeg - 90);
+  const delta = d2r(dipDeg);
+  const lambda = d2r(rakeDeg);
 
-  const sd = Math.sin(delta), cd = Math.cos(delta);
-  const sp = Math.sin(phi),   cp = Math.cos(phi);
-  const sl = Math.sin(lam),   cl = Math.cos(lam);
+  const sin_strike = Math.sin(strike_rad);
+  const cos_strike = Math.cos(strike_rad);
+  const sin_dip_dir = Math.sin(dip_direction);
+  const cos_dip_dir = Math.cos(dip_direction);
+  const sin_delta = Math.sin(delta);
+  const cos_delta = Math.cos(delta);
 
-  // 2. Formule Vettori Aki & Richards (1980) - ENU convention (X=E, Y=N, Z=U)
+  const n_e = sin_delta * sin_dip_dir;
+  const n_n = sin_delta * cos_dip_dir;
+  const n_u = cos_delta;
 
-  // Vettore Normale (n)
-  const n_e = sd * sp;
-  const n_n = -sd * cp;
-  const n_u = cd;
+  const t_e = sin_strike;
+  const t_n = cos_strike;
+  const t_u = 0.0;
 
-  // Vettore Slip (s)
-  const s_e = cl * cp + cd * sl * sp;
-  const s_n = cl * sp - cd * sl * cp;
-  const s_u = -sd * sl;
+  const cross_e = n_n * t_u - n_u * t_n;
+  const cross_n = n_u * t_e - n_e * t_u;
+  const cross_u = n_e * t_n - n_n * t_e;
+  const cross_mag = Math.sqrt(cross_e*cross_e + cross_n*cross_n + cross_u*cross_u) || 1.0;
 
-  const n_enu = new THREE.Vector3(n_e, n_n, n_u);
-  const s_enu = new THREE.Vector3(s_e, s_n, s_u);
+  const d_e = cross_e / cross_mag;
+  const d_n = cross_n / cross_mag;
+  const d_u = cross_u / cross_mag;
+
+  const s_e = Math.cos(lambda) * t_e + Math.sin(lambda) * d_e;
+  const s_n = Math.cos(lambda) * t_n + Math.sin(lambda) * d_n;
+  const s_u = Math.cos(lambda) * t_u + Math.sin(lambda) * d_u;
+
+  const n_enu = new THREE.Vector3(n_e, n_n, n_u).normalize();
+  const s_enu = new THREE.Vector3(s_e, s_n, s_u).normalize();
 
   return { n_enu, s_enu };
 }
 
-/**
- * Ottiene i vettori ENU e li trasforma in Three.js (Y-Up).
- * Applica una rotazione di 90° sul piano orizzontale (E-N) solo per la beachball.
- */
 function get_threejs_vectors(strike, dip, rake) {
   const { n_enu, s_enu } = get_enu_vectors(strike, dip, rake);
-
-  // --- VETTORE NORMALE PER IL PIANO GIALLO (NON RUOTATO) ---
-  // ENU (X_E, Y_N, Z_U) -> Three.js (X=E, Y=U, Z=-N)
-  const n_three_plane = new THREE.Vector3(n_enu.x, n_enu.z, -n_enu.y).normalize();
-
-  // --- VETTORI PER LA BEACHBALL (RUOTATI DI 90° ANTICIPATO) ---
-  // Rotazione di 90 gradi antioraria sul piano (E, N): E' = N, N' = -E
-
-  const n_rot_e = n_enu.y;
-  const n_rot_n = -n_enu.x;
-  const n_rot_u = n_enu.z;
-
-  const s_rot_e = s_enu.y;
-  const s_rot_n = -s_enu.x;
-  const s_rot_u = s_enu.z;
-
-  // Vettori ruotati, trasformati in Y-Up di Three.js (X=E', Y=U, Z=-N')
-  const n_three_ball = new THREE.Vector3(n_rot_e, n_rot_u, -n_rot_n).normalize();
-  const s_three_ball = new THREE.Vector3(s_rot_e, s_rot_u, -s_rot_n).normalize();
-
-  return {
-      n_plane: n_three_plane,
-      n_ball: n_three_ball,
-      s_ball: s_three_ball
-  };
+  const n_three = new THREE.Vector3(n_enu.x, n_enu.z, -n_enu.y).normalize();
+  const s_three = new THREE.Vector3(s_enu.x, s_enu.z, -s_enu.y).normalize();
+  return { n: n_three, s: s_three };
 }
 
-// Calcola il tensore momento usando i vettori ruotati (n_ball, s_ball)
 function buildMomentTensorFromSDR(strike, dip, rake) {
-  const { n_ball, s_ball } = get_threejs_vectors(strike, dip, rake);
-
-  const n = n_ball;
-  const s = s_ball;
-
-  // Calcolo tensore M = s*n + n*s
-  const M = [
+  const { n, s } = get_threejs_vectors(strike, dip, rake);
+  return [
     s.x * n.x + n.x * s.x, s.x * n.y + n.x * s.y, s.x * n.z + n.x * s.z,
     s.y * n.x + n.y * s.x, s.y * n.y + n.y * s.y, s.y * n.z + n.y * s.z,
     s.z * n.x + n.z * s.x, s.z * n.y + n.z * s.y, s.z * n.z + n.z * s.z
   ];
-
-  return M;
 }
 
-/**
- * Materiale Shader con calcoli in World Space per fissare l'orientamento.
- */
 function makeMomentBallMaterial(momentArray) {
-  const mat = new THREE.ShaderMaterial({
+  return new THREE.ShaderMaterial({
     uniforms: {
       lightDir: { value: new THREE.Vector3(1,2,3).normalize() },
       M: { value: momentArray.map(v=>v) },
-      colorComp: { value: new THREE.Color(0xc00000) }, // Rosso (Compressione)
-      colorDilat: { value: new THREE.Color(0xf0f0f0) } // Bianco (Dilatazione)
+      colorComp: { value: new THREE.Color(0xc00000) },
+      colorDilat: { value: new THREE.Color(0xf0f0f0) }
     },
     vertexShader: `
-      // modelMatrix e normalMatrix sono uniformi di default in Three.js, non vanno ridichiarate.
-      varying vec3 vWNormal; // World Space Normal
-
+      varying vec3 vWNormal;
       void main(){
-        // Trasforma la normale da Model a World Space
         vWNormal = normalize((modelMatrix * vec4(normal, 0.0)).xyz);
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
       }`,
@@ -241,10 +203,8 @@ function makeMomentBallMaterial(momentArray) {
       uniform float M[9];
       uniform vec3 colorComp;
       uniform vec3 colorDilat;
-      varying vec3 vWNormal; // La normale in World Space
-
+      varying vec3 vWNormal;
       vec3 Mmul_u(vec3 u) {
-        // Moltiplicazione M * u (dove u è la normale in World Space)
         return vec3(
           M[0]*u.x + M[1]*u.y + M[2]*u.z,
           M[3]*u.x + M[4]*u.y + M[5]*u.z,
@@ -252,31 +212,25 @@ function makeMomentBallMaterial(momentArray) {
         );
       }
       void main(){
-        vec3 u = normalize(vWNormal); // La normale è ora fissa nello spazio
+        vec3 u = normalize(vWNormal);
         vec3 Mu = Mmul_u(u);
-
-        // Calcolo del tensore: sigma è fisso rispetto al mondo
         float sigma = dot(u, Mu);
         float t = smoothstep(-0.0006, 0.0006, sigma);
         vec3 baseCol = mix(colorComp, colorDilat, t);
-
-        // Calcolo illuminazione: LightDir è in World Space
         float L = max(dot(u, normalize(lightDir)), 0.0);
         vec3 shaded = baseCol * (0.25 + 0.75 * L);
         gl_FragColor = vec4(shaded, 1.0);
       }`,
     side: THREE.DoubleSide
   });
-  return mat;
 }
 
 function createEventMesh(relX, relY, relZ, origX, origY, origZ, Md, strike, dip, rake, options = {}) {
-
   const radiusMultiplier = options.radiusMultiplier ?? 1.5;
   const minRadius = 5.0;
   const radius = Math.max(minRadius, (Md ** 3) * radiusMultiplier);
 
-  const { n_plane } = get_threejs_vectors(strike, dip, rake);
+  const { n: faultNormalYUp, s: slipVectorYUp } = get_threejs_vectors(strike, dip, rake);
 
   const M = buildMomentTensorFromSDR(strike, dip, rake);
   const mat = makeMomentBallMaterial(M);
@@ -288,42 +242,34 @@ function createEventMesh(relX, relY, relZ, origX, origY, origZ, Md, strike, dip,
 
   if (showPlanesCheckbox.checked) {
     const planeSize = radius * 6;
-
     const planeGeometry = new THREE.PlaneGeometry(planeSize, planeSize);
-    const planeMaterial = new THREE.MeshBasicMaterial({
-      color: 0xffea66, opacity: 0.55, transparent: true, side: THREE.DoubleSide, depthWrite: false
-    });
+    const planeMaterial = new THREE.MeshBasicMaterial({ color: 0xffea66, opacity: 0.55, transparent: true, side: THREE.DoubleSide, depthWrite: false });
     const plane = new THREE.Mesh(planeGeometry, planeMaterial);
-
-    // Allineamento Piano: Usa n_plane (vettore non ruotato, fisso)
     const zAxisDefault = new THREE.Vector3(0, 0, 1);
-    const rotationQuaternion = new THREE.Quaternion().setFromUnitVectors(zAxisDefault, n_plane);
-
+    const rotationQuaternion = new THREE.Quaternion().setFromUnitVectors(zAxisDefault, faultNormalYUp);
     plane.quaternion.copy(rotationQuaternion);
-
-    plane.position.copy(n_plane).multiplyScalar(0.0001);
-
+    plane.position.copy(faultNormalYUp).multiplyScalar(0.001);
     group.add(plane);
   }
 
-  // POSIZIONAMENTO SPAZIALE
-  const posx = relX; // X (East)
-  const posy = relZ; // Y (Up/Down) <- Z_UTM
-  const posz = -relY; // Z (North/South) <- Y_UTM
-
+  const posx = relX;
+  const posy = relZ;
+  const posz = -relY;
   group.position.set(posx, posy, posz);
 
   group.userData = {
     displayData: {
-      X: origX.toFixed(2), Y: origY.toFixed(2), Z: origZ.toFixed(2),
-      Md: Md.toFixed(2), Strike: strike.toFixed(2), Dip: dip.toFixed(2), Rake: rake.toFixed(2)
+      X: origX.toFixed(2),
+      Y: origY.toFixed(2),
+      Z: origZ.toFixed(2),
+      Md: Md.toFixed(2),
+      Strike: strike.toFixed(2),
+      Dip: dip.toFixed(2),
+      Rake: rake.toFixed(2)
     }
   };
-
   return group;
 }
-
-// --- Funzioni di gestione dati (invariate) ---
 
 function parseCSV(text) {
   const lines = text.trim().split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
@@ -340,119 +286,162 @@ function parseCSV(text) {
   return rows;
 }
 
+function calculateOffset(rows) {
+  let sumX = 0, sumY = 0, sumZ = 0;
+  let validCount = 0;
+  rows.forEach(r => {
+    const x_val = r.X || r.Lon;
+    const y_val = r.Y || r.Lat;
+    const z_val = r.Z || r.Depth;
+    const x = parseFloat(x_val), y = parseFloat(y_val), z = parseFloat(z_val);
+    if (!isNaN(x) && !isNaN(y) && !isNaN(z)) { sumX += x; sumY += y; sumZ += z; validCount++; }
+  });
+  if (validCount > 0) sceneCenterOffset.set(sumX / validCount, sumY / validCount, sumZ / validCount); else sceneCenterOffset.set(0, 0, 0);
+}
+
+function disposeMaterial(m) { if (!m) return; if (Array.isArray(m)) m.forEach(x=>{ if (x.map) x.map.dispose(); x.dispose(); }); else { if (m.map) m.map.dispose(); m.dispose(); } }
+
 function clearEvents() {
   while (rootGroup.children.length) {
     const c = rootGroup.children[0];
-    c.traverse(o=>{
-      if (o.geometry) { o.geometry.dispose(); }
-      if (o.material) {
-        if (Array.isArray(o.material)) o.material.forEach(m=>m.dispose());
-        else o.material.dispose();
-      }
-    });
+    c.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); });
     rootGroup.remove(c);
   }
+  if (axesGroup) { axesGroup.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); }); scene.remove(axesGroup); axesGroup = null; }
+}
+
+function createTextSprite(text, color='#0000ff') {
+  const canvas = document.createElement('canvas'); const size = 256; canvas.width = size; canvas.height = size; const ctx = canvas.getContext('2d'); ctx.clearRect(0,0,size,size); ctx.font = '28px Arial'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = color; ctx.fillText(text, size/2, size/2); const texture = new THREE.CanvasTexture(canvas); texture.needsUpdate = true; const mat = new THREE.SpriteMaterial({ map: texture, depthTest: false, depthWrite: false }); const sprite = new THREE.Sprite(mat); sprite.scale.set(300, 80, 1); return sprite;
+}
+
+function drawAxes(center, size) {
+  if (axesGroup) { axesGroup.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); }); scene.remove(axesGroup); axesGroup = null; }
+  axesGroup = new THREE.Group();
+  const axisLen = Math.max(size.x || 0, size.z || 0, 1000) * 2.0;
+  const halfX = axisLen / 2;
+  const worldY0 = 0 - sceneCenterOffset.z;
+  const matX = new THREE.LineBasicMaterial({ color: 0xff0000 });
+  const matZ = new THREE.LineBasicMaterial({ color: 0x00aa00 });
+  const matY = new THREE.LineBasicMaterial({ color: 0x0000ff });
+  const xGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x - halfX, worldY0, center.z), new THREE.Vector3(center.x + halfX, worldY0, center.z) ]);
+  axesGroup.add(new THREE.Line(xGeo, matX));
+  const zGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x, worldY0, center.z - halfX), new THREE.Vector3(center.x, worldY0, center.z + halfX) ]);
+  axesGroup.add(new THREE.Line(zGeo, matZ));
+  const maxDepth = 5000;
+  const yTop = worldY0;
+  const yBottom = (-maxDepth) - sceneCenterOffset.z;
+  const yGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x, yTop, center.z), new THREE.Vector3(center.x, yBottom, center.z) ]);
+  axesGroup.add(new THREE.Line(yGeo, matY));
+  const tickStep = 500;
+  const tickLen = Math.max(axisLen * 0.01, 10);
+  for (let d = 0; d >= -maxDepth; d -= tickStep) {
+    const yWorld = d - sceneCenterOffset.z;
+    const tGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x - tickLen*0.5, yWorld, center.z), new THREE.Vector3(center.x + tickLen*0.5, yWorld, center.z) ]);
+    axesGroup.add(new THREE.Line(tGeo, matY));
+    const labelText = String(d);
+    const sprite = createTextSprite(labelText, '#0000ff');
+    sprite.position.set(center.x + tickLen, yWorld, center.z);
+    axesGroup.add(sprite);
+  }
+  scene.add(axesGroup);
+}
+
+function parseToDate(str) {
+  if (!str) return null;
+  str = String(str).trim();
+  const dm = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](.*))?$/);
+  if (dm) {
+    const day = Number(dm[1]);
+    const month = Number(dm[2]);
+    let year = Number(dm[3]);
+    const timePart = dm[4] || '00:00:00';
+    if (year < 100) year += 2000;
+    const t = (timePart.split('.'))[0];
+    const iso = `${year.toString().padStart(4,'0')}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}T${t}`;
+    const d = new Date(iso);
+    if (!isNaN(d)) return d;
+  }
+  let s = str.replace(' ', 'T');
+  s = s.replace(/(\.\d{3})\d+/, '$1');
+  let d = new Date(s);
+  if (!isNaN(d)) return d;
+  d = new Date(str);
+  if (!isNaN(d)) return d;
+  return null;
+}
+
+function formatDateToDDMMYYYY_HHMMSS(d) {
+  if (!d) return '';
+  const pad = n => String(n).padStart(2,'0');
+  const day = pad(d.getUTCDate());
+  const month = pad(d.getUTCMonth()+1);
+  const year = d.getUTCFullYear();
+  const hours = pad(d.getUTCHours());
+  const mins = pad(d.getUTCMinutes());
+  const secs = pad(d.getUTCSeconds());
+  return `${day}/${month}/${year} ${hours}:${mins}:${secs}`;
 }
 
 function updateSceneFromData() {
-  if (lastLoadedRows.length === 0) { return; }
-
+  if (lastLoadedRows.length === 0) return;
   clearEvents();
-
   const currentRadiusMultiplier = parseFloat(radiusScaleInput.value);
-
   const bbox = new THREE.Box3();
-
   lastLoadedRows.forEach(r=>{
-    const M_val = r.Md || r.Ml;
-
+    const M_val = r.Md || r.Ml || r.Mag;
     const x = parseFloat(r.X), y = parseFloat(r.Y), z = parseFloat(r.Z);
     const Md = parseFloat(M_val) || 1.0;
     const strike = parseFloat(r.Strike) || 0;
     const dip = parseFloat(r.Dip) || 90;
     const rake = parseFloat(r.Rake) || 0;
-
     if (isNaN(x)||isNaN(y)||isNaN(z)) return;
-
     const relX = x - sceneCenterOffset.x;
     const relY = y - sceneCenterOffset.y;
     const relZ = z - sceneCenterOffset.z;
-
-    const meshGroup = createEventMesh(
-      relX, relY, relZ,
-      x, y, z,
-      Md, strike, dip, rake,
-      { radiusMultiplier: currentRadiusMultiplier }
-    );
-
+    const meshGroup = createEventMesh(relX, relY, relZ, x, y, z, Md, strike, dip, rake, { radiusMultiplier: currentRadiusMultiplier });
+    let dtString = null;
+    if (r.Date && r.Time) dtString = `${r.Date} ${r.Time}`;
+    else if (r.Time) dtString = r.Time;
+    else if (r.Date) dtString = r.Date;
+    else if (r.Timestamp) dtString = r.Timestamp;
+    const parsed = parseToDate(dtString);
+    const formattedTime = parsed ? formatDateToDDMMYYYY_HHMMSS(parsed) : (dtString || '');
+    if (!meshGroup.userData) meshGroup.userData = {};
+    if (!meshGroup.userData.displayData) meshGroup.userData.displayData = {};
+    meshGroup.userData.displayData.Time = formattedTime;
     rootGroup.add(meshGroup);
-
     bbox.expandByPoint(meshGroup.position);
   });
-
-  if (controls.target.lengthSq() < 1) {
+  if (rootGroup.children.length > 0) {
     const center = new THREE.Vector3();
     bbox.getCenter(center);
     const size = new THREE.Vector3();
     bbox.getSize(size);
     const maxDim = Math.max(size.x, size.y, size.z);
-
     const cameraDistance = Math.max(maxDim, 1000) * 2.5;
-
     controls.target.copy(center);
-
-    camera.position.set(
-      center.x + cameraDistance * 0.7,
-      center.y + cameraDistance * 0.7,
-      center.z + cameraDistance * 0.7
-    );
-
-    camera.near = 0.01;
+    camera.position.set(center.x + cameraDistance * 0.7, center.y + cameraDistance * 0.7, center.z + cameraDistance * 0.7);
+    camera.near = 0.1;
     camera.far = 1e7;
     camera.updateProjectionMatrix();
-
-    controls.minDistance = 0.01;
+    controls.minDistance = 0.1;
     controls.maxDistance = cameraDistance * 2;
-
     controls.update();
-  } else {
-    controls.update();
-  }
+    drawAxes(center, size);
+  } else { controls.update(); }
 }
 
 fileInput.addEventListener('change', (ev)=>{
   const f = ev.target.files[0];
   if (!f) return;
   const reader = new FileReader();
-
   reader.onload = (e) => {
     lastLoadedRows = parseCSV(e.target.result);
-    if (lastLoadedRows.length === 0) { return; }
-
-    let sumX = 0, sumY = 0, sumZ = 0;
-    let validCount = 0;
-
-    lastLoadedRows.forEach(r => {
-        const x = parseFloat(r.X), y = parseFloat(r.Y), z = parseFloat(r.Z);
-        if (!isNaN(x) && !isNaN(y) && !isNaN(z)) {
-            sumX += x; sumY += y; sumZ += z;
-            validCount++;
-        }
-    });
-
-    if (validCount === 0) { return; }
-
-    sceneCenterOffset.set(
-        sumX / validCount,
-        sumY / validCount,
-        sumZ / validCount
-    );
-
+    if (lastLoadedRows.length === 0) { alert("Nessun dato valido trovato nel CSV."); return; }
+    calculateOffset(lastLoadedRows);
     controls.target.set(0,0,0);
-
     updateSceneFromData();
   };
-
   reader.readAsText(f);
 });
 
@@ -460,47 +449,32 @@ function onCanvasClick(event) {
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
   raycaster.setFromCamera(mouse, camera);
-
   const intersects = raycaster.intersectObjects(rootGroup.children, true);
-  const hit = intersects.find(h => h.object.geometry.type === 'SphereGeometry');
-
+  const hit = intersects.find(h => h.object.geometry && h.object.geometry.type === 'SphereGeometry');
   if (hit) {
     const group = hit.object.parent;
     if (group && group.userData.displayData) {
       const data = group.userData.displayData;
-
       tooltip.innerHTML = `
-        <strong>X (UTM):</strong> ${data.X}<br>
-        <strong>Y (UTM):</strong> ${data.Y}<br>
-        <strong>Z (m):</strong> ${data.Z}<br>
-        <strong>Md:</strong> ${data.Md}<br>
-        <strong>Strike:</strong> ${data.Strike}<br>
-        <strong>Dip (CSV):</strong> ${data.Dip}<br>
-        <strong>Rake:</strong> ${data.Rake}
+        <strong>X/UTM:</strong> ${data.X}<br>
+        <strong>Y/UTM:</strong> ${data.Y}<br>
+        <strong>Z/Depth:</strong> ${data.Z}<br>
+        <strong>Md/Ml:</strong> ${data.Md}<br>
+        <strong>Strike:</strong> ${data.Strike}°<br>
+        <strong>Dip:</strong> ${data.Dip}°<br>
+        <strong>Rake:</strong> ${data.Rake}°<br>
+        ${data.Time ? `<strong>Time:</strong> ${data.Time}<br>` : ''}
       `;
       tooltip.style.display = 'block';
       tooltip.style.left = (event.clientX + 10) + 'px';
       tooltip.style.top = (event.clientY + 10) + 'px';
     }
-  } else {
-    tooltip.style.display = 'none';
-  }
+  } else { tooltip.style.display = 'none'; }
 }
 
-function onWindowResize(){
-  const w = container.clientWidth, h = container.clientHeight;
-  camera.aspect = w/h;
-  camera.updateProjectionMatrix();
-  renderer.setSize(w,h);
-}
-
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
-}
+function onWindowResize(){ const w = container.clientWidth, h = container.clientHeight; camera.aspect = w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h); }
+function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
 </script>
 </body>
 </html>
