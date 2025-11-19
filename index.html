@@ -92,7 +92,7 @@ function initScene(){
   camera = new THREE.PerspectiveCamera(45, w/h, 0.1, 1e7);
   camera.position.set(5000, 5000, 5000);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicsphereBuffer: true });
+  renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
   renderer.sortObjects = false;
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(container.clientWidth, container.clientHeight);
