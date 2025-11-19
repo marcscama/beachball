@@ -4,4 +4,8 @@ X,Y,Z,Md,Date,Time,Strike,Dip,Rake
 
 X,Y,Z,Ml,Time,Strike,Dip,Rake
 428444.546543,4518324.922363,-2674.000000,3.954667,2025-03-13 00:25:02.710000+00:00,299.409500,6.409000,14.690200
+
+X,Y,Z,Md,Ml,Time,Strike,Dip,Rake
+426740.476676,4520063.181020,-1888.000000,3.900000,3.424735,2025-03-15 12:32:27.460000+00:00,279.000000,51.000000,-71.000000
+
 <img width="1915" height="799" alt="Screenshot_20251118_130211" src="https://github.com/user-attachments/assets/e653f2c9-fdfe-434a-a0d9-ede88e70bae9" />
