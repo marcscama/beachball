@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Beachballs Viewer</title>
+<style>
+  html,body { height:100%; margin:0; background: linear-gradient(to bottom, #f6f6f6 0%, #d0d0d0 30%, #9a9a9a 75%, #6b6b6b 100%); font-family:system-ui,Segoe UI,Roboto,Arial; }
+  #app { height:100vh; display:flex; flex-direction:column; }
+  #topbar { padding:8px; background:#fff; box-shadow:0 1px 4px rgba(0,0,0,0.06); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #canvaswrap { flex:1; position:relative; overflow:hidden; }
+  canvas { display:block; width:100%; height:100%; }
+  label { font-size:13px; }
+  input[type="file"] { display:inline-block; }
+  .controls { margin-left:auto; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+
+  #tooltip {
+    position: absolute;
+    display: none;
+    padding: 8px;
+    background: rgba(0,0,0,0.75);
+    color: white;
+    border-radius: 4px;
+    font-size: 12px;
+    pointer-events: none;
+    line-height: 1.4;
+    z-index: 100;
+  }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@latest/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@latest/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <label class="info">CSV header= (X,Y in UTM,Z in metri negativi,Md o Ml,Date,Time o Time,Strike,Dip,Rake - case sensitive):</label>
+    <input id="file" type="file" accept=".csv" />
+
+    <div class="controls">
+      <label>Moltiplicatore Raggio (M³ × k):</label>
+      <input id="radiusScale" type="range" min="0.1" max="3" step="0.05" value="1.5" />
+      <span id="scaleVal">1.5</span>
+
+      <label style="margin-left:10px;"><input id="showPlanes" type="checkbox" checked /> Piani di faglia</label>
+    </div>
+  </div>
+
+  <div id="canvaswrap">
+    <div id="tooltip"></div>
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const container = document.getElementById('canvaswrap');
+const fileInput = document.getElementById('file');
+const showPlanesCheckbox = document.getElementById('showPlanes');
+const tooltip = document.getElementById('tooltip');
+const radiusScaleInput = document.getElementById('radiusScale');
+const scaleValSpan = document.getElementById('scaleVal');
+
+let scene, camera, renderer, controls;
+let rootGroup;
+let raycaster, mouse;
+let axesGroup = null;
+let directionalLight;
+
+let lastLoadedRows = [];
+let sceneCenterOffset = new THREE.Vector3(0, 0, 0);
+let csvHasMd = false;
+let csvHasMl = false;
+
+const d2r = deg => deg * Math.PI / 180;
+
+initScene();
+animate();
+
+function initScene(){
+  scene = new THREE.Scene();
+  scene.background = null;
+
+  const w = container.clientWidth, h = container.clientHeight;
+  camera = new THREE.PerspectiveCamera(45, w/h, 0.1, 1e7);
+  camera.position.set(5000, 5000, 5000);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: false });
+  renderer.sortObjects = false;
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setClearColor(0x000000, 0);
+  container.appendChild(renderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0,0,0);
+
+  controls.minDistance = 0.1;
+  controls.maxDistance = 10000;
+  controls.zoomSpeed = 10.0;
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+  controls.mouseButtons.MIDDLE = THREE.MOUSE.DOLLY;
+  controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+  controls.update();
+
+  directionalLight = new THREE.DirectionalLight(0xffffff, 2.0);
+  scene.add(directionalLight);
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+  rootGroup = new THREE.Group();
+  scene.add(rootGroup);
+
+  raycaster = new THREE.Raycaster();
+  mouse = new THREE.Vector2();
+
+  renderer.domElement.addEventListener('click', onCanvasClick);
+  controls.addEventListener('start', () => { tooltip.style.display = 'none'; });
+
+  scaleValSpan.textContent = radiusScaleInput.value;
+  radiusScaleInput.addEventListener('input', () => { scaleValSpan.textContent = radiusScaleInput.value; updateSceneFromData(); });
+  showPlanesCheckbox.addEventListener('change', () => { updateSceneFromData(); });
+
+  window.addEventListener('resize', onWindowResize);
+}
+
+function get_enu_vectors(strikeDeg, dipDeg, rakeDeg) {
+  const strike_rad = d2r(strikeDeg);
+  const dip_direction = d2r(strikeDeg - 90);
+  const delta = d2r(dipDeg);
+  const lambda = d2r(rakeDeg);
+
+  const sin_strike = Math.sin(strike_rad);
+  const cos_strike = Math.cos(strike_rad);
+  const sin_dip_dir = Math.sin(dip_direction);
+  const cos_dip_dir = Math.cos(dip_direction);
+  const sin_delta = Math.sin(delta);
+  const cos_delta = Math.cos(delta);
+
+  const n_e = sin_delta * sin_dip_dir;
+  const n_n = sin_delta * cos_dip_dir;
+  const n_u = cos_delta;
+
+  const t_e = sin_strike;
+  const t_n = cos_strike;
+  const t_u = 0.0;
+
+  const cross_e = n_n * t_u - n_u * t_n;
+  const cross_n = n_u * t_e - n_e * t_u;
+  const cross_u = n_e * t_n - n_n * t_e;
+  const cross_mag = Math.sqrt(cross_e*cross_e + cross_n*cross_n + cross_u*cross_u) || 1.0;
+
+  const d_e = cross_e / cross_mag;
+  const d_n = cross_n / cross_mag;
+  const d_u = cross_u / cross_mag;
+
+  const s_e = Math.cos(lambda) * t_e + Math.sin(lambda) * d_e;
+  const s_n = Math.cos(lambda) * t_n + Math.sin(lambda) * d_n;
+  const s_u = Math.cos(lambda) * t_u + Math.sin(lambda) * d_u;
+
+  const n_enu = new THREE.Vector3(n_e, n_n, n_u).normalize();
+  const s_enu = new THREE.Vector3(s_e, s_n, s_u).normalize();
+
+  return { n_enu, s_enu };
+}
+
+function get_threejs_vectors(strike, dip, rake) {
+  const { n_enu, s_enu } = get_enu_vectors(strike, dip, rake);
+  const n_three = new THREE.Vector3(n_enu.x, n_enu.z, -n_enu.y).normalize();
+  const s_three = new THREE.Vector3(s_enu.x, s_enu.z, -s_enu.y).normalize();
+  return { n: n_three, s: s_three };
+}
+
+function buildMomentTensorFromSDR(strike, dip, rake) {
+  const { n, s } = get_threejs_vectors(strike, dip, rake);
+  return [
+    s.x * n.x + n.x * s.x, s.x * n.y + n.x * s.y, s.x * n.z + n.x * s.z,
+    s.y * n.x + n.y * s.x, s.y * n.y + n.y * s.y, s.y * n.z + n.y * s.z,
+    s.z * n.x + n.z * s.x, s.z * n.y + n.z * s.y, s.z * n.z + n.z * s.z
+  ];
+}
+
+function makeMomentBallMaterial(momentArray) {
+  return new THREE.ShaderMaterial({
+    uniforms: {
+      lightDir: { value: new THREE.Vector3(1,2,3).normalize() },
+      M: { value: momentArray.map(v=>v) },
+      colorComp: { value: new THREE.Color(0xc00000) },
+      colorDilat: { value: new THREE.Color(0xf0f0f0) }
+    },
+    vertexShader: `
+      varying vec3 vWNormal;
+      void main(){
+        vWNormal = normalize((modelMatrix * vec4(normal, 0.0)).xyz);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+      }`,
+    fragmentShader: `
+      uniform vec3 lightDir;
+      uniform float M[9];
+      uniform vec3 colorComp;
+      uniform vec3 colorDilat;
+      varying vec3 vWNormal;
+      vec3 Mmul_u(vec3 u) {
+        return vec3(
+          M[0]*u.x + M[1]*u.y + M[2]*u.z,
+          M[3]*u.x + M[4]*u.y + M[5]*u.z,
+          M[6]*u.x + M[7]*u.y + M[8]*u.z
+        );
+      }
+      void main(){
+        vec3 u = normalize(vWNormal);
+        vec3 Mu = Mmul_u(u);
+        float sigma = dot(u, Mu);
+        float t = smoothstep(-0.0006, 0.0006, sigma);
+        vec3 baseCol = mix(colorComp, colorDilat, t);
+        float L = max(dot(u, normalize(lightDir)), 0.0);
+        vec3 shaded = baseCol * (0.25 + 0.75 * L);
+        gl_FragColor = vec4(shaded, 1.0);
+      }`,
+    side: THREE.DoubleSide,
+    transparent: false,
+    depthTest: true,
+    depthWrite: true
+  });
+}
+
+function createEventMesh(relX, relY, relZ, origX, origY, origZ, Md, Ml, strike, dip, rake, options = {}) {
+  const radiusMultiplier = options.radiusMultiplier ?? 1.5;
+  const minRadius = 5.0;
+  
+  const magForRadius = Md !== null ? Md : (Ml !== null ? Ml : 1.0);
+  const radius = Math.max(minRadius, (magForRadius ** 3) * radiusMultiplier);
+
+  const { n: faultNormalYUp, s: slipVectorYUp } = get_threejs_vectors(strike, dip, rake);
+
+  const M = buildMomentTensorFromSDR(strike, dip, rake);
+  const mat = makeMomentBallMaterial(M);
+  const geom = new THREE.SphereGeometry(radius, 96, 64);
+  const sph = new THREE.Mesh(geom, mat);
+  sph.castShadow = true; sph.receiveShadow = true;
+  sph.renderOrder = 100;
+
+  const group = new THREE.Group();
+  group.add(sph);
+
+  if (showPlanesCheckbox.checked) {
+    const planeSize = radius * 6;
+    const planeGeometry = new THREE.PlaneGeometry(planeSize, planeSize);
+    const planeMaterial = new THREE.MeshBasicMaterial({ 
+      color: 0xffea66, 
+      opacity: 0.45,
+      transparent: true,
+      side: THREE.DoubleSide, 
+      depthWrite: true,
+      depthTest: true
+    });
+    const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+    plane.renderOrder = 1;
+    const zAxisDefault = new THREE.Vector3(0, 0, 1);
+    const rotationQuaternion = new THREE.Quaternion().setFromUnitVectors(zAxisDefault, faultNormalYUp);
+    plane.quaternion.copy(rotationQuaternion);
+    plane.position.copy(faultNormalYUp).multiplyScalar(0.001);
+    group.add(plane);
+  }
+
+  const posx = relX;
+  const posy = relZ;
+  const posz = -relY;
+  group.position.set(posx, posy, posz);
+
+  group.userData = {
+    displayData: {
+      X: origX.toFixed(2),
+      Y: origY.toFixed(2),
+      Z: origZ.toFixed(2),
+      Md: Md !== null ? Md.toFixed(2) : null,
+      Ml: Ml !== null ? Ml.toFixed(2) : null,
+      Strike: strike.toFixed(2),
+      Dip: dip.toFixed(2),
+      Rake: rake.toFixed(2)
+    }
+  };
+  return group;
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
+  if (lines.length < 2) return [];
+  const header = lines[0].split(',').map(s=>s.trim());
+  
+  csvHasMd = header.includes('Md');
+  csvHasMl = header.includes('Ml');
+  
+  const rows = [];
+  for (let i=1;i<lines.length;i++){
+    const cols = lines[i].split(',').map(s=>s.trim());
+    if (cols.length < header.length) { continue; }
+    const obj = {};
+    for (let j=0;j<header.length;j++){ obj[header[j]] = cols[j]; }
+    rows.push(obj);
+  }
+  return rows;
+}
+
+function calculateOffset(rows) {
+  let sumX = 0, sumY = 0, sumZ = 0;
+  let validCount = 0;
+  rows.forEach(r => {
+    const x_val = r.X || r.Lon;
+    const y_val = r.Y || r.Lat;
+    const z_val = r.Z || r.sphere;
+    const x = parseFloat(x_val), y = parseFloat(y_val), z = parseFloat(z_val);
+    if (!isNaN(x) && !isNaN(y) && !isNaN(z)) { sumX += x; sumY += y; sumZ += z; validCount++; }
+  });
+  if (validCount > 0) sceneCenterOffset.set(sumX / validCount, sumY / validCount, sumZ / validCount); else sceneCenterOffset.set(0, 0, 0);
+}
+
+function disposeMaterial(m) { if (!m) return; if (Array.isArray(m)) m.forEach(x=>{ if (x.map) x.map.dispose(); x.dispose(); }); else { if (m.map) m.map.dispose(); m.dispose(); } }
+
+function clearEvents() {
+  while (rootGroup.children.length) {
+    const c = rootGroup.children[0];
+    c.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); });
+    rootGroup.remove(c);
+  }
+  if (axesGroup) { axesGroup.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); }); scene.remove(axesGroup); axesGroup = null; }
+}
+
+function createTextSprite(text, color='#0000ff') {
+  const canvas = document.createElement('canvas'); 
+  const size = 256; 
+  canvas.width = size; 
+  canvas.height = size; 
+  const ctx = canvas.getContext('2d'); 
+  ctx.clearRect(0,0,size,size); 
+  ctx.font = 'bold 32px Arial'; 
+  ctx.textAlign = 'center'; 
+  ctx.textBaseline = 'middle'; 
+  ctx.fillStyle = color; 
+  ctx.fillText(text, size/2, size/2); 
+  const texture = new THREE.CanvasTexture(canvas); 
+  texture.needsUpdate = true; 
+  const mat = new THREE.SpriteMaterial({ map: texture, depthTest: true, depthWrite: true });
+  const sprite = new THREE.Sprite(mat); 
+  sprite.scale.set(400, 100, 1); 
+  sprite.renderOrder = -999;
+  return sprite;
+}
+
+function drawAxes(center, size) {
+  if (axesGroup) { axesGroup.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); }); scene.remove(axesGroup); axesGroup = null; }
+  axesGroup = new THREE.Group();
+  
+  const axisLen = Math.max(size.x || 0, size.z || 0, 1000) * 2.0;
+  const halfX = axisLen / 2;
+  const worldY0 = 0 - sceneCenterOffset.z;
+  
+  const matX = new THREE.LineBasicMaterial({ color: 0xff0000, depthTest: true, depthWrite: true });
+  const matZ = new THREE.LineBasicMaterial({ color: 0x00aa00, depthTest: true, depthWrite: true });
+  const matY = new THREE.LineBasicMaterial({ color: 0x0000ff, depthTest: true, depthWrite: true });
+  
+  // Asse X
+  const xGeo = new THREE.BufferGeometry().setFromPoints([ 
+    new THREE.Vector3(center.x - halfX, worldY0, center.z), 
+    new THREE.Vector3(center.x + halfX, worldY0, center.z) 
+  ]);
+  const xLine = new THREE.Line(xGeo, matX);
+  xLine.renderOrder = -999;
+  axesGroup.add(xLine);
+  
+  // Etichette asse X
+  const labelXE = createTextSprite('X-E', '#ff0000');
+  labelXE.position.set(center.x + halfX + 200, worldY0, center.z);
+  axesGroup.add(labelXE);
+  
+  const labelXW = createTextSprite('X-W', '#ff0000');
+  labelXW.position.set(center.x - halfX - 200, worldY0, center.z);
+  axesGroup.add(labelXW);
+  
+  // Asse Z
+  const zGeo = new THREE.BufferGeometry().setFromPoints([ 
+    new THREE.Vector3(center.x, worldY0, center.z - halfX), 
+    new THREE.Vector3(center.x, worldY0, center.z + halfX) 
+  ]);
+  const zLine = new THREE.Line(zGeo, matZ);
+  zLine.renderOrder = -999;
+  axesGroup.add(zLine);
+  
+  // Etichette asse Z (Nord/Sud)
+  const labelN = createTextSprite('N-(Z=-Y)', '#00aa00');
+  labelN.position.set(center.x, worldY0, center.z - halfX - 200);
+  axesGroup.add(labelN);
+  
+  const labelS = createTextSprite('S-(Z=Y)', '#00aa00');
+  labelS.position.set(center.x, worldY0, center.z + halfX + 200);
+  axesGroup.add(labelS);
+  
+  // Asse Y verticale
+  const maxsphere = 5000;
+  const yTop = worldY0;
+  const yBottom = (-maxsphere) - sceneCenterOffset.z;
+  const yGeo = new THREE.BufferGeometry().setFromPoints([ 
+    new THREE.Vector3(center.x, yTop, center.z), 
+    new THREE.Vector3(center.x, yBottom, center.z) 
+  ]);
+  const yLine = new THREE.Line(yGeo, matY);
+  yLine.renderOrder = -999;
+  axesGroup.add(yLine);
+  
+  // Etichette asse Y (profondità)
+  const labelZPlus = createTextSprite('Z+(Y=Z)', '#0000ff');
+  labelZPlus.position.set(center.x + 300, yTop + 100, center.z);
+  axesGroup.add(labelZPlus);
+  
+  const labelZMinus = createTextSprite('Z-(Y=-Z)', '#0000ff');
+  labelZMinus.position.set(center.x + 300, yBottom - 100, center.z);
+  axesGroup.add(labelZMinus);
+  
+  const tickStep = 500;
+  const tickLen = Math.max(axisLen * 0.01, 10);
+  for (let d = 0; d >= -maxsphere; d -= tickStep) {
+    const yWorld = d - sceneCenterOffset.z;
+    const tGeo = new THREE.BufferGeometry().setFromPoints([ 
+      new THREE.Vector3(center.x - tickLen*0.5, yWorld, center.z), 
+      new THREE.Vector3(center.x + tickLen*0.5, yWorld, center.z) 
+    ]);
+    const tLine = new THREE.Line(tGeo, matY);
+    tLine.renderOrder = -999;
+    axesGroup.add(tLine);
+    
+    const labelText = String(d);
+    const sprite = createTextSprite(labelText, '#0000ff');
+    sprite.position.set(center.x + tickLen + 100, yWorld, center.z);
+    axesGroup.add(sprite);
+  }
+  scene.add(axesGroup);
+}
+
+function parseToDate(str) {
+  if (!str) return null;
+  str = String(str).trim();
+  const dm = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](.*))?$/);
+  if (dm) {
+    const day = Number(dm[1]);
+    const month = Number(dm[2]);
+    let year = Number(dm[3]);
+    const timePart = dm[4] || '00:00:00';
+    if (year < 100) year += 2000;
+    const t = (timePart.split('.'))[0];
+    const iso = `${year.toString().padStart(4,'0')}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}T${t}`;
+    const d = new Date(iso);
+    if (!isNaN(d)) return d;
+  }
+  let s = str.replace(' ', 'T');
+  s = s.replace(/(\.\d{3})\d+/, '$1');
+  let d = new Date(s);
+  if (!isNaN(d)) return d;
+  d = new Date(str);
+  if (!isNaN(d)) return d;
+  return null;
+}
+
+function formatDateToDDMMYYYY_HHMMSS(d) {
+  if (!d) return '';
+  const pad = n => String(n).padStart(2,'0');
+  const day = pad(d.getUTCDate());
+  const month = pad(d.getUTCMonth()+1);
+  const year = d.getUTCFullYear();
+  const hours = pad(d.getUTCHours());
+  const mins = pad(d.getUTCMinutes());
+  const secs = pad(d.getUTCSeconds());
+  return `${day}/${month}/${year} ${hours}:${mins}:${secs}`;
+}
+
+function updateSceneFromData() {
+  if (lastLoadedRows.length === 0) return;
+  clearEvents();
+  const currentRadiusMultiplier = parseFloat(radiusScaleInput.value);
+  const bbox = new THREE.Box3();
+  lastLoadedRows.forEach(r=>{
+    const x = parseFloat(r.X), y = parseFloat(r.Y), z = parseFloat(r.Z);
+    
+    const Md_val = csvHasMd ? parseFloat(r.Md) : null;
+    const Ml_val = csvHasMl ? parseFloat(r.Ml) : null;
+    
+    let Md = !isNaN(Md_val) ? Md_val : null;
+    let Ml = !isNaN(Ml_val) ? Ml_val : null;
+    if (Md === null && Ml === null) {
+      const mag = parseFloat(r.Mag);
+      if (!isNaN(mag)) Ml = mag;
+    }
+    
+    const strike = parseFloat(r.Strike) || 0;
+    const dip = parseFloat(r.Dip) || 90;
+    const rake = parseFloat(r.Rake) || 0;
+    if (isNaN(x)||isNaN(y)||isNaN(z)) return;
+    const relX = x - sceneCenterOffset.x;
+    const relY = y - sceneCenterOffset.y;
+    const relZ = z - sceneCenterOffset.z;
+    const meshGroup = createEventMesh(relX, relY, relZ, x, y, z, Md, Ml, strike, dip, rake, { radiusMultiplier: currentRadiusMultiplier });
+    let dtString = null;
+    if (r.Date && r.Time) dtString = `${r.Date} ${r.Time}`;
+    else if (r.Time) dtString = r.Time;
+    else if (r.Date) dtString = r.Date;
+    else if (r.Timestamp) dtString = r.Timestamp;
+    const parsed = parseToDate(dtString);
+    const formattedTime = parsed ? formatDateToDDMMYYYY_HHMMSS(parsed) : (dtString || '');
+    if (!meshGroup.userData) meshGroup.userData = {};
+    if (!meshGroup.userData.displayData) meshGroup.userData.displayData = {};
+    meshGroup.userData.displayData.Time = formattedTime;
+    rootGroup.add(meshGroup);
+    bbox.expandByPoint(meshGroup.position);
+  });
+  if (rootGroup.children.length > 0) {
+    const center = new THREE.Vector3();
+    bbox.getCenter(center);
+    const size = new THREE.Vector3();
+    bbox.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const cameraDistance = Math.max(maxDim, 1000) * 2.5;
+    controls.target.copy(center);
+    camera.position.set(center.x + cameraDistance * 0.7, center.y + cameraDistance * 0.7, center.z + cameraDistance * 0.7);
+    camera.near = 0.1;
+    camera.far = 1e7;
+    camera.updateProjectionMatrix();
+    controls.minDistance = 0.1;
+    controls.maxDistance = cameraDistance * 2;
+    controls.update();
+    drawAxes(center, size);
+  } else { controls.update(); }
+}
+
+fileInput.addEventListener('change', (ev)=>{
+  const f = ev.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    lastLoadedRows = parseCSV(e.target.result);
+    if (lastLoadedRows.length === 0) { alert("Nessun dato valido trovato nel CSV."); return; }
+    calculateOffset(lastLoadedRows);
+    controls.target.set(0,0,0);
+    updateSceneFromData();
+  };
+  reader.readAsText(f);
+});
+
+function onCanvasClick(event) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(rootGroup.children, true);
+  const hit = intersects.find(h => h.object.geometry && h.object.geometry.type === 'SphereGeometry');
+  if (hit) {
+    const group = hit.object.parent;
+    if (group && group.userData.displayData) {
+      const data = group.userData.displayData;
+      
+      let tooltipHTML = `
+        <strong>X/UTM:</strong> ${data.X}<br>
+        <strong>Y/UTM:</strong> ${data.Y}<br>
+        <strong>Z/Depth:</strong> ${data.Z}<br>
+      `;
+      
+      if (data.Md !== null && data.Ml !== null) {
+        tooltipHTML += `<strong>Md:</strong> ${data.Md}<br>`;
+        tooltipHTML += `<strong>Ml:</strong> ${data.Ml}<br>`;
+      } else if (data.Md !== null) {
+        tooltipHTML += `<strong>Md:</strong> ${data.Md}<br>`;
+      } else if (data.Ml !== null) {
+        tooltipHTML += `<strong>Ml:</strong> ${data.Ml}<br>`;
+      }
+      
+      tooltipHTML += `
+        <strong>Strike:</strong> ${data.Strike}°<br>
+        <strong>Dip:</strong> ${data.Dip}°<br>
+        <strong>Rake:</strong> ${data.Rake}°<br>
+        ${data.Time ? `<strong>Time:</strong> ${data.Time}<br>` : ''}
+      `;
+      
+      tooltip.innerHTML = tooltipHTML;
+      tooltip.style.display = 'block';
+      tooltip.style.left = (event.clientX + 10) + 'px';
+      tooltip.style.top = (event.clientY + 10) + 'px';
+    }
+  } else { tooltip.style.display = 'none'; }
+}
+
+function onWindowResize(){ const w = container.clientWidth, h = container.clientHeight; camera.aspect = w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h); }
+
+function animate() { 
+  requestAnimationFrame(animate); 
+  controls.update(); 
+  
+  // Aggiorna la direzione della luce per seguire la camera (dietro la camera)
+  const lightDirection = new THREE.Vector3();
+  camera.getWorldDirection(lightDirection);
+  lightDirection.multiplyScalar(-1);
+  directionalLight.position.copy(camera.position).add(lightDirection.multiplyScalar(100));
+  
+  // Aggiorna l'uniform della luce nello shader
+  rootGroup.children.forEach(child => {
+    child.traverse(obj => {
+      if (obj.material && obj.material.uniforms && obj.material.uniforms.lightDir) {
+        const dir = new THREE.Vector3();
+        camera.getWorldDirection(dir);
+        dir.multiplyScalar(-1);
+        obj.material.uniforms.lightDir.value.copy(dir.normalize());
+      }
+    });
+  });
+  
+  renderer.render(scene, camera); 
+}
+</script>
+</body>
+</html>
