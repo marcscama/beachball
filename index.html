@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Beachballs Viewer</title>
+  <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+      background: linear-gradient(to bottom, #f6f6f6 0%, #d0d0d0 30%, #9a9a9a 75%, #6b6b6b 100%);
+      font-family: system-ui, "Segoe UI", Roboto, Arial;
+    }
+    #app { height: 100vh; display:flex; flex-direction:column; }
+    #topbar {
+      padding:8px;
+      background:#fff;
+      box-shadow:0 1px 4px rgba(0,0,0,0.06);
+      display:flex;
+      gap:8px;
+      align-items:center;
+      flex-wrap:wrap;
+    }
+    #canvaswrap { flex:1; position:relative; overflow:hidden; }
+    canvas { display:block; width:100%; height:100%; }
+    label { font-size:13px; }
+    input[type="file"] { display:inline-block; }
+    .controls { margin-left:auto; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    #tooltip {
+      position:absolute;
+      display:none;
+      padding:8px;
+      background:rgba(0,0,0,0.75);
+      color:white;
+      border-radius:4px;
+      font-size:12px;
+      pointer-events:none;
+      line-height:1.4;
+      z-index:100;
+    }
+    #exportBtn { margin-left:10px; padding:4px 12px; cursor:pointer; background:#4CAF50; color:white; border:none; border-radius:4px; font-size:13px; }
+    #exportBtn:hover { background:#45a049; }
+    #exportBtn:disabled { background:#cccccc; cursor:not-allowed; }
+    #validationMessage { margin-left:10px; padding:4px 8px; font-size:12px; border-radius:4px; display:none; max-width:380px; word-break:break-word; }
+    #validationMessage.success { background:#4CAF50; color:white; }
+    #validationMessage.error { background:#f44336; color:white; }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@latest/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@latest/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="topbar">
+      <label class="info">CSV header = (X,Y in UTM,Z in metri negativi,Md o Ml,Date,Time,Strike,Dip,Rake - case sensitive):</label>
+      <input id="file" type="file" accept=".csv" />
+      <div class="controls">
+        <label>Moltiplicatore Raggio (M³ × k):</label>
+        <input id="radiusScale" type="range" min="0.1" max="3" step="0.05" value="1.5" />
+        <span id="scaleVal">1.5</span>
+        <label style="margin-left:10px;"><input id="showPlanes" type="checkbox" checked /> Piani di faglia</label>
+        <button id="exportBtn">Esporta GLB</button>
+        <div id="validationMessage"></div>
+      </div>
+    </div>
+    <div id="canvaswrap"><div id="tooltip"></div></div>
+  </div>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+  import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+
+  // DOM
+  const container = document.getElementById('canvaswrap');
+  const fileInput = document.getElementById('file');
+  const showPlanesCheckbox = document.getElementById('showPlanes');
+  const tooltip = document.getElementById('tooltip');
+  const radiusScaleInput = document.getElementById('radiusScale');
+  const scaleValSpan = document.getElementById('scaleVal');
+  const exportBtn = document.getElementById('exportBtn');
+  const validationMessage = document.getElementById('validationMessage');
+
+  // Globals
+  let scene, camera, renderer, controls, rootGroup, raycaster, mouse, axesGroup, directionalLight;
+  let lastLoadedRows = [];
+  let sceneCenterOffset = new THREE.Vector3(0,0,0);
+  let csvHasMd = false, csvHasMl = false;
+  let selectedGroup = null, highlightObjects = [];
+  let csvHeaders = [], csvContent = '';
+
+  // Config
+  const REQUIRED_HEADERS = ['X','Y','Z','Strike','Dip','Rake'];
+  const MAGNITUDE_HEADERS = ['Md','Ml'];
+
+  const d2r = deg => deg * Math.PI / 180.0;
+
+  initScene();
+  animate();
+
+  // Helpers: validation, messages
+  function showValidationMessage(msg, isSuccess) {
+    validationMessage.textContent = msg;
+    validationMessage.className = isSuccess ? 'success' : 'error';
+    validationMessage.style.display = 'block';
+    if (isSuccess) setTimeout(()=>validationMessage.style.display='none', 3000);
+  }
+
+  function validateCSVHeaders(headers) {
+    const missing = REQUIRED_HEADERS.filter(h => !headers.includes(h));
+    const hasMag = MAGNITUDE_HEADERS.some(h => headers.includes(h));
+    return { isValid: missing.length === 0 && hasMag, missing, hasMag };
+  }
+
+  function validateCSVRow(row, headers) {
+    const errors = [];
+    ['X','Y','Z','Strike','Dip','Rake'].forEach(f => {
+      if (headers.includes(f)) {
+        const v = parseFloat(row[f]);
+        if (Number.isNaN(v)) errors.push(`${f} non è un numero valido`);
+      }
+    });
+    const magField = csvHasMd ? 'Md' : (csvHasMl ? 'Ml' : null);
+    if (magField && headers.includes(magField)) {
+      const v = parseFloat(row[magField]);
+      if (Number.isNaN(v)) errors.push(`${magField} non è un numero valido`);
+    }
+    return errors;
+  }
+
+
+  function calculateOpacityFromMagnitude(magnitude) {
+    // magnitude can be null or NaN
+    if (magnitude === null || Number.isNaN(magnitude)) return 0.20; // default transparent
+    const mag = Number(magnitude);
+    if (mag < 0) return 0.20;
+    if (mag >= 5.0) return 0.90;
+    if (mag >= 4.0) return 0.80;
+    if (mag >= 3.0) return 0.40;
+    if (mag >= 2.0) return 0.30;
+    if (mag >= 1.0) return 0.20;
+    return 0.20;
+  }
+
+  // Scene init
+  function initScene() {
+    scene = new THREE.Scene();
+    scene.background = null;
+    const w = container.clientWidth, h = container.clientHeight;
+    camera = new THREE.PerspectiveCamera(45, w/h, 0.1, 1e7);
+    camera.position.set(5000,5000,5000);
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.sortObjects = false;
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(w,h);
+    renderer.setClearColor(0x000000, 0);
+    container.appendChild(renderer.domElement);
+
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0,0,0);
+    controls.minDistance = 0.01;
+    controls.maxDistance = 10000;
+    controls.zoomSpeed = 10.0;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.update();
+
+    directionalLight = new THREE.DirectionalLight(0xffffff, 2.55);
+    scene.add(directionalLight);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+
+    rootGroup = new THREE.Group();
+    scene.add(rootGroup);
+
+    raycaster = new THREE.Raycaster();
+    mouse = new THREE.Vector2();
+
+    renderer.domElement.addEventListener('click', onCanvasClick);
+    controls.addEventListener('start', ()=>{ tooltip.style.display='none'; });
+
+    scaleValSpan.textContent = radiusScaleInput.value;
+    radiusScaleInput.addEventListener('input', ()=>{ scaleValSpan.textContent = radiusScaleInput.value; updateSceneFromData(); });
+    showPlanesCheckbox.addEventListener('change', updateSceneFromData);
+    window.addEventListener('resize', onWindowResize);
+  }
+
+  function get_enu_vectors(strikeDeg, dipDeg, rakeDeg) {
+  const strike = d2r(strikeDeg);
+  const dip_direction = d2r(strikeDeg - 90.0);
+  const delta = d2r(dipDeg);
+  const lambda = d2r(rakeDeg);
+
+  const sin_strike = Math.sin(strike);
+  const cos_strike = Math.cos(strike);
+  const sin_dip_dir = Math.sin(dip_direction);
+  const cos_dip_dir = Math.cos(dip_direction);
+  const sin_delta = Math.sin(delta);
+  const cos_delta = Math.cos(delta);
+
+  const n_e = sin_delta * sin_dip_dir;
+  const n_n = sin_delta * cos_dip_dir;
+  const n_u = cos_delta;
+
+  // tangent (strike) vector (horizontal component along strike)
+  const t_e = sin_strike;
+  const t_n = cos_strike;
+  const t_u = 0.0;
+
+  const cross_e = n_n * t_u - n_u * t_n;
+  const cross_n = n_u * t_e - n_e * t_u;
+  const cross_u = n_e * t_n - n_n * t_e;
+  const cross_mag = Math.sqrt(cross_e*cross_e + cross_n*cross_n + cross_u*cross_u) || 1.0;
+
+  const d_e = cross_e / cross_mag;
+  const d_n = cross_n / cross_mag;
+  const d_u = cross_u / cross_mag;
+
+  const s_e = Math.cos(lambda) * t_e + Math.sin(lambda) * d_e;
+  const s_n = Math.cos(lambda) * t_n + Math.sin(lambda) * d_n;
+  const s_u = Math.cos(lambda) * t_u + Math.sin(lambda) * d_u;
+
+  return {
+    n_enu: new THREE.Vector3(n_e, n_n, n_u).normalize(),
+    s_enu: new THREE.Vector3(s_e, s_n, s_u).normalize(),
+    dip_enu: new THREE.Vector3(d_e, d_n, d_u).normalize(),
+    t_enu: new THREE.Vector3(t_e, t_n, t_u).normalize() // <- strike (tangent) vector in ENU
+  };
+}
+
+function get_threejs_vectors(strike, dip, rake) {
+  const { n_enu, s_enu, dip_enu, t_enu } = get_enu_vectors(strike, dip, rake);
+  // mappatura ENU -> ThreeJS usata nel file: (E, N, U) -> (x, y, z) = (E, U, -N)
+  const n_three = new THREE.Vector3(n_enu.x, n_enu.z, -n_enu.y).normalize();
+  const s_three = new THREE.Vector3(s_enu.x, s_enu.z, -s_enu.y).normalize();
+  const dip_three = new THREE.Vector3(dip_enu.x, dip_enu.z, -dip_enu.y).normalize();
+  const t_three = new THREE.Vector3(t_enu.x, t_enu.z, -t_enu.y).normalize(); // strike vector in ThreeJS coords
+  return { n: n_three, s: s_three, dip: dip_three, t: t_three };
+}
+
+  function buildMomentTensorFromSDR(strike, dip, rake) {
+    const { n, s } = get_threejs_vectors(strike, dip, rake);
+    return [
+      s.x*n.x + n.x*s.x, s.x*n.y + n.x*s.y, s.x*n.z + n.x*s.z,
+      s.y*n.x + n.y*s.x, s.y*n.y + n.y*s.y, s.y*n.z + n.y*s.z,
+      s.z*n.x + n.z*s.x, s.z*n.y + n.z*s.y, s.z*n.z + n.z*s.z
+    ];
+  }
+
+  function makeMomentBallMaterial(momentArray) {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        lightDir: { value: new THREE.Vector3(1,2,3).normalize() },
+        M: { value: momentArray.slice(0) },
+        colorComp: { value: new THREE.Color(0xc00000) },
+        colorDilat: { value: new THREE.Color(0xf0f0f0) }
+      },
+      vertexShader: `
+        varying vec3 vWNormal;
+        void main(){
+          vWNormal = normalize((modelMatrix * vec4(normal, 0.0)).xyz);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+        }`,
+      fragmentShader: `
+        uniform vec3 lightDir;
+        uniform float M[9];
+        uniform vec3 colorComp;
+        uniform vec3 colorDilat;
+        varying vec3 vWNormal;
+        vec3 Mmul_u(vec3 u) {
+          return vec3(
+            M[0]*u.x + M[1]*u.y + M[2]*u.z,
+            M[3]*u.x + M[4]*u.y + M[5]*u.z,
+            M[6]*u.x + M[7]*u.y + M[8]*u.z
+          );
+        }
+        void main(){
+          vec3 u = normalize(vWNormal);
+          vec3 Mu = Mmul_u(u);
+          float sigma = dot(u, Mu);
+          float t = smoothstep(-0.0006, 0.0006, sigma);
+          vec3 baseCol = mix(colorComp, colorDilat, t);
+          float L = max(dot(u, normalize(lightDir)), 0.0);
+          vec3 shaded = baseCol * (0.25 + 0.75 * L);
+          gl_FragColor = vec4(shaded, 1.0);
+        }`,
+      side: THREE.DoubleSide,
+      transparent: false
+    });
+  }
+
+  function createStriatedFaultPlane(radius, faultNormalYUp, slipVector, magnitude, strikeVector) {
+  const planeSize = radius * 6.0;
+
+  // compute categorical opacity first
+  const opacity = calculateOpacityFromMagnitude(magnitude);
+
+  const zAxisDefault = new THREE.Vector3(0,0,1);
+  const rotationQuaternion = new THREE.Quaternion().setFromUnitVectors(zAxisDefault, faultNormalYUp);
+
+  // keep plane basis in case fallback needed
+  const planeX = new THREE.Vector3(1,0,0).applyQuaternion(rotationQuaternion);
+  const planeY = new THREE.Vector3(0,1,0).applyQuaternion(rotationQuaternion);
+
+  // project slip and strike on the fault plane
+  const slipOnPlane = slipVector.clone().projectOnPlane(faultNormalYUp);
+  let slipAzimuthAngle = 0;
+
+  if (strikeVector && strikeVector.lengthSq() > 1e-9) {
+    const strikeOnPlane = strikeVector.clone().projectOnPlane(faultNormalYUp);
+    if (strikeOnPlane.lengthSq() > 1e-9 && slipOnPlane.lengthSq() > 1e-9) {
+      strikeOnPlane.normalize();
+      slipOnPlane.normalize();
+      // perp direction in-plane (90° from strike)
+      const perp = new THREE.Vector3().crossVectors(faultNormalYUp, strikeOnPlane).normalize();
+      // angle from strike -> slip (right-handed) in radians
+      slipAzimuthAngle = Math.atan2(slipOnPlane.dot(perp), slipOnPlane.dot(strikeOnPlane));
+    } else {
+      // fallback to old method if projection gave degenerate vectors
+      const slipDotX = slipOnPlane.dot(planeX);
+      const slipDotY = slipOnPlane.dot(planeY);
+      slipAzimuthAngle = Math.atan2(slipDotX, slipDotY);
+    }
+  } else {
+    // if no strikeVector provided, fallback to old method
+    const slipDotX = slipOnPlane.dot(planeX);
+    const slipDotY = slipOnPlane.dot(planeY);
+    slipAzimuthAngle = Math.atan2(slipDotX, slipDotY);
+  }
+
+  // canvas with alpha baked according to category opacity
+  const canvasSize = 512;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvasSize;
+  canvas.height = canvasSize;
+  const ctx = canvas.getContext('2d', { alpha: true });
+  ctx.clearRect(0,0,canvasSize,canvasSize);
+
+  ctx.save();
+  ctx.translate(canvasSize/2, canvasSize/2);
+  ctx.rotate(slipAzimuthAngle);
+  ctx.translate(-canvasSize/2, -canvasSize/2);
+
+  const darkRGBA = 'rgba(184,134,11,' + opacity.toFixed(3) + ')'; // #B8860B
+  const lightRGBA = 'rgba(255,250,205,' + opacity.toFixed(3) + ')'; // #FFFACD
+
+  const numStripes = Math.ceil(1.0 / 0.15);
+  const stripeHeight = canvasSize / numStripes;
+  const overscan = canvasSize * 1.5;
+  const startY = -overscan/2;
+  const numStripesExtended = Math.ceil(overscan / stripeHeight) + numStripes;
+  for (let i=0;i<numStripesExtended;i++){
+    const y = startY + i * stripeHeight;
+    ctx.fillStyle = (i % 2 === 0) ? darkRGBA : lightRGBA;
+    ctx.fillRect(-overscan/2, y, overscan*2, stripeHeight);
+  }
+  ctx.restore();
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.format = THREE.RGBAFormat;
+  texture.needsUpdate = true;
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+
+  const planeMaterial = new THREE.MeshBasicMaterial({
+    map: texture,
+    transparent: true,
+    opacity: 1.0, // alpha baked into texture
+    side: THREE.DoubleSide,
+    depthWrite: false
+  });
+
+  const planeGeometry = new THREE.PlaneGeometry(planeSize, planeSize);
+  const plane = new THREE.Mesh(planeGeometry, planeMaterial);
+  plane.quaternion.copy(rotationQuaternion);
+  plane.position.copy(faultNormalYUp).multiplyScalar(0.001);
+  plane.renderOrder = 1;
+  return plane;
+}
+
+
+  // Highlights, horizon, event mesh, parsing, etc. (unchanged from working version)
+  function createHighlights(group, radius, faultNormalYUp, dipDirection) {
+    const highlights = [];
+    const color = 0x9B59B6;
+    const segments = 128;
+    const pts = [];
+    let ref = new THREE.Vector3(1,0,0);
+    if (Math.abs(faultNormalYUp.dot(ref)) > 0.9) ref.set(0,1,0);
+    const t1 = new THREE.Vector3().crossVectors(faultNormalYUp, ref).normalize();
+    const t2 = new THREE.Vector3().crossVectors(faultNormalYUp, t1).normalize();
+    for (let i=0;i<=segments;i++){
+      const a = (i/segments)*Math.PI*2.0;
+      const x = Math.cos(a)*radius, y = Math.sin(a)*radius;
+      pts.push(t1.clone().multiplyScalar(x).add(t2.clone().multiplyScalar(y)));
+    }
+    const geom = new THREE.BufferGeometry().setFromPoints(pts);
+    const glowMat = new THREE.LineBasicMaterial({ color, linewidth:4, transparent:true, opacity:0.3 });
+    const glow = new THREE.Line(geom.clone(), glowMat); glow.renderOrder = 24; highlights.push(glow);
+    const mat = new THREE.LineBasicMaterial({ color, linewidth:2, transparent:true, opacity:0.9 });
+    const outline = new THREE.Line(geom, mat); outline.renderOrder = 25; highlights.push(outline);
+
+    const planeSize = radius*6.0; const half = planeSize/2.0;
+    const rectanglePoints = [ new THREE.Vector3(-half,-half,0), new THREE.Vector3(half,-half,0), new THREE.Vector3(half,half,0), new THREE.Vector3(-half,half,0), new THREE.Vector3(-half,-half,0) ];
+    const rectGeom = new THREE.BufferGeometry().setFromPoints(rectanglePoints);
+    const rectGlow = new THREE.Line(rectGeom.clone(), glowMat); rectGlow.renderOrder = 24;
+    const rectOutline = new THREE.Line(rectGeom, mat); rectOutline.renderOrder = 25;
+    const zAxisDefault = new THREE.Vector3(0,0,1);
+    const rotQ = new THREE.Quaternion().setFromUnitVectors(zAxisDefault, faultNormalYUp);
+    rectGlow.quaternion.copy(rotQ); rectOutline.quaternion.copy(rotQ);
+    rectGlow.position.copy(faultNormalYUp).multiplyScalar(0.001); rectOutline.position.copy(faultNormalYUp).multiplyScalar(0.001);
+    highlights.push(rectGlow, rectOutline);
+
+    highlights.forEach(h => group.add(h));
+    return highlights;
+  }
+
+  function removeHighlights() {
+    if (!selectedGroup) return;
+    highlightObjects.forEach(o => {
+      selectedGroup.remove(o);
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        if (Array.isArray(o.material)) o.material.forEach(m => { if (m.map) m.map.dispose(); m.dispose(); });
+        else { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+      }
+    });
+    highlightObjects = [];
+    selectedGroup = null;
+  }
+
+  function createHorizonLine(radius) {
+    const seg = 128; const pts=[];
+    for (let i=0;i<=seg;i++){ const a=(i/seg)*Math.PI*2.0; pts.push(new THREE.Vector3(Math.cos(a)*radius,0,Math.sin(a)*radius)); }
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const mat = new THREE.LineBasicMaterial({ color:0x00FFFF, linewidth:2, transparent:true, opacity:0.9 });
+    const line = new THREE.Line(geo, mat); line.renderOrder = 20; return line;
+  }
+
+  function createEventMesh(relX, relY, relZ, origX, origY, origZ, Md, Ml, strike, dip, rake, options={}) {
+    const radiusMultiplier = options.radiusMultiplier !== undefined ? options.radiusMultiplier : parseFloat(radiusScaleInput.value) || 1.5;
+    const minRadius = 5.0;
+    const magForRadius = (Md !== null && !Number.isNaN(Md)) ? Md : ((Ml !== null && !Number.isNaN(Ml)) ? Ml : 1.0);
+    const radius = Math.max(minRadius, Math.pow(magForRadius, 3.0) * radiusMultiplier);
+
+    const { n: faultNormalYUp, s: slipVectorYUp, dip: dipDirection,  t: strikeVector } = get_threejs_vectors(strike, dip, rake);
+    const M = buildMomentTensorFromSDR(strike, dip, rake);
+    const mat = makeMomentBallMaterial(M);
+    const geom = new THREE.SphereGeometry(radius, 64, 48);
+    const sph = new THREE.Mesh(geom, mat);
+    sph.castShadow = true; sph.receiveShadow = true; sph.renderOrder = 10;
+
+    const group = new THREE.Group();
+    group.add(sph);
+
+    const horizon = createHorizonLine(radius*1.01); group.add(horizon);
+
+    // prefer Md if present, otherwise Ml
+    const magnitude = (Md !== null && !Number.isNaN(Md)) ? Md : ((Ml !== null && !Number.isNaN(Ml)) ? Ml : null);
+    if (showPlanesCheckbox.checked) {
+      const plane = createStriatedFaultPlane(radius, faultNormalYUp, slipVectorYUp, magnitude, strikeVector );
+      group.add(plane);
+    }
+
+    group.position.set(relX, relZ, -relY);
+
+    group.userData = {
+      displayData: {
+        X: origX !== undefined ? Number(origX).toFixed(2) : '',
+        Y: origY !== undefined ? Number(origY).toFixed(2) : '',
+        Z: origZ !== undefined ? Number(origZ).toFixed(2) : '',
+        Md: (Md !== null && !Number.isNaN(Md)) ? Number(Md).toFixed(2) : null,
+        Ml: (Ml !== null && !Number.isNaN(Ml)) ? Number(Ml).toFixed(2) : null,
+        Strike: Number(strike).toFixed(2), Dip: Number(dip).toFixed(2), Rake: Number(rake).toFixed(2)
+      },
+      highlightData: { radius, faultNormalYUp, dipDirection }
+    };
+
+    return group;
+  }
+
+  function parseCSV(text) {
+    if (!text) return [];
+    const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
+    if (lines.length < 2) return [];
+    csvHeaders = lines[0].split(',').map(s=>s.trim());
+    csvHasMd = csvHeaders.includes('Md'); csvHasMl = csvHeaders.includes('Ml');
+    const hv = validateCSVHeaders(csvHeaders);
+    if (!hv.isValid) { showValidationMessage('Header CSV invalidi: ' + hv.missing.join(', '), false); return []; }
+    const rows = [];
+    for (let i=1;i<lines.length;i++){
+      const cols = lines[i].split(',').map(s=>s.trim());
+      if (cols.length < csvHeaders.length) continue;
+      const obj = {};
+      for (let j=0;j<csvHeaders.length;j++) obj[csvHeaders[j]] = cols[j];
+      const errs = validateCSVRow(obj, csvHeaders);
+      if (errs.length === 0) rows.push(obj); else console.warn(`riga ${i+1} saltata: ${errs.join('; ')}`);
+    }
+    return rows;
+  }
+
+  function calculateOffset(rows) {
+    let sx=0, sy=0, sz=0, cnt=0;
+    rows.forEach(r => {
+      const x = parseFloat(r.X), y = parseFloat(r.Y), z = parseFloat(r.Z);
+      if (!Number.isNaN(x) && !Number.isNaN(y) && !Number.isNaN(z)) { sx+=x; sy+=y; sz+=z; cnt++; }
+    });
+    if (cnt>0) sceneCenterOffset.set(sx/cnt, sy/cnt, sz/cnt); else sceneCenterOffset.set(0,0,0);
+  }
+
+  function disposeMaterial(m) {
+    if (!m) return;
+    if (Array.isArray(m)) m.forEach(x => { if (x.map) x.map.dispose(); if (x.dispose) x.dispose(); });
+    else { if (m.map) m.map.dispose(); if (m.dispose) m.dispose(); }
+  }
+
+  function clearEvents() {
+    removeHighlights();
+    while (rootGroup.children.length) {
+      const c = rootGroup.children[0];
+      c.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); });
+      rootGroup.remove(c);
+    }
+    if (axesGroup) { axesGroup.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); }); scene.remove(axesGroup); axesGroup = null; }
+  }
+
+  function createTextSprite(text, color='#0000ff') {
+    const size = 256;
+    const canvas = document.createElement('canvas'); canvas.width=size; canvas.height=size;
+    const ctx = canvas.getContext('2d'); ctx.clearRect(0,0,size,size);
+    ctx.font='bold 32px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillStyle=color; ctx.fillText(text, size/2, size/2);
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex });
+    const sp = new THREE.Sprite(mat); sp.scale.set(400,100,1); sp.renderOrder = -999; return sp;
+  }
+
+  function drawAxes(center, size) {
+    if (axesGroup) { axesGroup.traverse(o=>{ if (o.geometry) o.geometry.dispose(); if (o.material) disposeMaterial(o.material); }); scene.remove(axesGroup); axesGroup=null; }
+    axesGroup = new THREE.Group();
+    const axisLen = Math.max(size.x||0, size.z||0, 1000) * 2.0;
+    const halfX = axisLen/2.0; const worldY0 = 0 - sceneCenterOffset.z;
+    const matX = new THREE.LineBasicMaterial({ color:0xff0000 });
+    const matZ = new THREE.LineBasicMaterial({ color:0x00aa00 });
+    const matY = new THREE.LineBasicMaterial({ color:0x0000ff });
+
+    const xGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x-halfX, worldY0, center.z), new THREE.Vector3(center.x+halfX, worldY0, center.z) ]);
+    const xLine = new THREE.Line(xGeo, matX); xLine.renderOrder=-999; axesGroup.add(xLine);
+    const labelXE = createTextSprite('X-E','#ff0000'); labelXE.position.set(center.x+halfX+200, worldY0, center.z); axesGroup.add(labelXE);
+    const labelXW = createTextSprite('X-W','#ff0000'); labelXW.position.set(center.x-halfX-200, worldY0, center.z); axesGroup.add(labelXW);
+
+    const zGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x, worldY0, center.z-halfX), new THREE.Vector3(center.x, worldY0, center.z+halfX) ]);
+    const zLine = new THREE.Line(zGeo, matZ); zLine.renderOrder=-999; axesGroup.add(zLine);
+    const labelN = createTextSprite('N-(Z=-Y)', '#00aa00'); labelN.position.set(center.x, worldY0, center.z-halfX-200); axesGroup.add(labelN);
+    const labelS = createTextSprite('S-(Z=Y)', '#00aa00'); labelS.position.set(center.x, worldY0, center.z+halfX+200); axesGroup.add(labelS);
+
+    const maxsphere = 5000; const yTop = worldY0; const yBottom = (-maxsphere) - sceneCenterOffset.z;
+    const yGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x, yTop, center.z), new THREE.Vector3(center.x, yBottom, center.z) ]);
+    const yLine = new THREE.Line(yGeo, matY); yLine.renderOrder=-999; axesGroup.add(yLine);
+    const labelZPlus = createTextSprite('Z+(Y=Z)','#0000ff'); labelZPlus.position.set(center.x+300, yTop+100, center.z); axesGroup.add(labelZPlus);
+    const labelZMinus = createTextSprite('Z-(Y=-Z)','#0000ff'); labelZMinus.position.set(center.x+300, yBottom-100, center.z); axesGroup.add(labelZMinus);
+
+    const tickStep = 500; const tickLen = Math.max(axisLen*0.01, 10);
+    for (let d=0; d>=-maxsphere; d-=tickStep) {
+      const yWorld = d - sceneCenterOffset.z;
+      const tGeo = new THREE.BufferGeometry().setFromPoints([ new THREE.Vector3(center.x - tickLen*0.5, yWorld, center.z), new THREE.Vector3(center.x + tickLen*0.5, yWorld, center.z) ]);
+      const tLine = new THREE.Line(tGeo, matY); tLine.renderOrder=-999; axesGroup.add(tLine);
+      const sprite = createTextSprite(String(d), '#0000ff'); sprite.position.set(center.x + tickLen + 100, yWorld, center.z); axesGroup.add(sprite);
+    }
+
+    scene.add(axesGroup);
+  }
+
+  // Date helpers
+  function parseToDate(str) {
+    if (!str) return null;
+    str = String(str).trim();
+    const dm = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[ T](.*))?$/);
+    if (dm) {
+      const day = Number(dm[1]), month = Number(dm[2]); let year = Number(dm[3]); const timePart = dm[4] || '00:00:00';
+      if (year < 100) year += 2000;
+      const t = (timePart.split('.'))[0];
+      const iso = year.toString().padStart(4,'0') + '-' + String(month).padStart(2,'0') + '-' + String(day).padStart(2,'0') + 'T' + t;
+      const d = new Date(iso); if (!isNaN(d)) return d;
+    }
+    let s = str.replace(' ', 'T'); s = s.replace(/(\.\d{3})\d+/, '$1'); let d = new Date(s); if (!isNaN(d)) return d;
+    d = new Date(str); if (!isNaN(d)) return d; return null;
+  }
+  function formatDateToDDMMYYYY_HHMMSS(d) {
+    if (!d) return ''; const pad = n => String(n).padStart(2,'0');
+    const day = pad(d.getUTCDate()), month = pad(d.getUTCMonth()+1), year = d.getUTCFullYear();
+    const hours = pad(d.getUTCHours()), mins = pad(d.getUTCMinutes()), secs = pad(d.getUTCSeconds());
+    return `${day}/${month}/${year} ${hours}:${mins}:${secs}`;
+  }
+
+  function updateSceneFromData() {
+    if (!lastLoadedRows || lastLoadedRows.length === 0) return;
+    clearEvents();
+    const currentRadiusMultiplier = parseFloat(radiusScaleInput.value) || 1.5;
+    const bbox = new THREE.Box3();
+
+    lastLoadedRows.forEach(r => {
+      const x = parseFloat(r.X), y = parseFloat(r.Y), z = parseFloat(r.Z);
+      if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(z)) return;
+      const Md_val = csvHasMd ? parseFloat(r.Md) : null;
+      const Ml_val = csvHasMl ? parseFloat(r.Ml) : null;
+      const Md = !Number.isNaN(Md_val) ? Md_val : null;
+      const Ml = !Number.isNaN(Ml_val) ? Ml_val : null;
+
+      const strike = parseFloat(r.Strike) || 0;
+      const dip = parseFloat(r.Dip) || 90;
+      const rake = parseFloat(r.Rake) || 0;
+
+      const relX = x - sceneCenterOffset.x;
+      const relY = y - sceneCenterOffset.y;
+      const relZ = z - sceneCenterOffset.z;
+
+      const meshGroup = createEventMesh(relX, relY, relZ, x, y, z, Md, Ml, strike, dip, rake, { radiusMultiplier: currentRadiusMultiplier });
+
+      let dtString = null;
+      if (r.Date && r.Time) dtString = `${r.Date} ${r.Time}`;
+      else if (r.Time) dtString = r.Time;
+      else if (r.Date) dtString = r.Date;
+      else if (r.Timestamp) dtString = r.Timestamp;
+      const parsed = parseToDate(dtString);
+      const formattedTime = parsed ? formatDateToDDMMYYYY_HHMMSS(parsed) : (dtString || '');
+      meshGroup.userData = meshGroup.userData || {};
+      meshGroup.userData.displayData = meshGroup.userData.displayData || {};
+      meshGroup.userData.displayData.Time = formattedTime;
+
+      rootGroup.add(meshGroup);
+      bbox.expandByPoint(meshGroup.position);
+    });
+
+    if (rootGroup.children.length > 0) {
+      const center = new THREE.Vector3(); bbox.getCenter(center);
+      const size = new THREE.Vector3(); bbox.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const cameraDistance = Math.max(maxDim, 1000) * 2.5;
+      controls.target.copy(center);
+      camera.position.set(center.x + cameraDistance*0.7, center.y + cameraDistance*0.7, center.z + cameraDistance*0.7);
+      camera.near = 0.1; camera.far = 1e7; camera.updateProjectionMatrix();
+      controls.minDistance = 0.1; controls.maxDistance = cameraDistance * 2.0; controls.update();
+      drawAxes(center, size);
+    } else { controls.update(); }
+  }
+
+  // File handling
+  fileInput.addEventListener('change', ev => {
+    const f = ev.target.files[0]; if (!f) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      csvContent = e.target.result;
+      lastLoadedRows = parseCSV(csvContent);
+      if (!lastLoadedRows || lastLoadedRows.length === 0) { showValidationMessage('Nessun dato valido trovato nel CSV', false); return; }
+      calculateOffset(lastLoadedRows);
+      controls.target.set(0,0,0);
+      updateSceneFromData();
+      showValidationMessage('Caricati ' + lastLoadedRows.length + ' eventi', true);
+    };
+    reader.onerror = () => showValidationMessage('Errore nella lettura del file', false);
+    reader.readAsText(f);
+  });
+
+  function onCanvasClick(event) {
+    const rect = renderer.domElement.getBoundingClientRect();
+    mouse.x = ((event.clientX-rect.left)/rect.width)*2.0 - 1.0;
+    mouse.y = -((event.clientY-rect.top)/rect.height)*2.0 + 1.0;
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(rootGroup.children, true);
+    const hit = intersects.find(h => h.object && h.object.geometry && (h.object.geometry.type === 'SphereGeometry' || h.object.geometry.type === 'PlaneGeometry'));
+    if (hit) {
+      const group = hit.object.parent; removeHighlights();
+      if (selectedGroup !== group) {
+        selectedGroup = group;
+        if (group.userData && group.userData.highlightData) {
+          const hd = group.userData.highlightData;
+          highlightObjects = createHighlights(group, hd.radius, hd.faultNormalYUp, hd.dipDirection);
+        }
+      }
+      if (group && group.userData && group.userData.displayData) {
+        const data = group.userData.displayData;
+        let html = `<strong>X/UTM:</strong> ${data.X}<br><strong>Y/UTM:</strong> ${data.Y}<br><strong>Z/Depth:</strong> ${data.Z}<br>`;
+        if (data.Md !== null && data.Ml !== null) html += `<strong>Md:</strong> ${data.Md}<br><strong>Ml:</strong> ${data.Ml}<br>`;
+        else if (data.Md !== null) html += `<strong>Md:</strong> ${data.Md}<br>`; else if (data.Ml !== null) html += `<strong>Ml:</strong> ${data.Ml}<br>`;
+        html += `<strong>Strike:</strong> ${data.Strike}°<br><strong>Dip:</strong> ${data.Dip}°<br><strong>Rake:</strong> ${data.Rake}°<br>`;
+        if (data.Time) html += `<strong>Time:</strong> ${data.Time}<br>`;
+        tooltip.innerHTML = html; tooltip.style.display='block';
+        tooltip.style.left = (event.clientX + 10) + 'px'; tooltip.style.top = (event.clientY + 10) + 'px';
+      }
+    } else { removeHighlights(); tooltip.style.display='none'; }
+  }
+
+  function onWindowResize() {
+    const w = container.clientWidth, h = container.clientHeight;
+    camera.aspect = w/h; camera.updateProjectionMatrix(); renderer.setSize(w,h);
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    const lightDirection = new THREE.Vector3();
+    camera.getWorldDirection(lightDirection); lightDirection.multiplyScalar(-1.0);
+    directionalLight.position.copy(camera.position).add(lightDirection.multiplyScalar(100));
+    rootGroup.children.forEach(child => {
+      child.traverse(obj => {
+        if (obj.material && obj.material.uniforms && obj.material.uniforms.lightDir) {
+          const dir = new THREE.Vector3(); camera.getWorldDirection(dir); dir.multiplyScalar(-1.0);
+          obj.material.uniforms.lightDir.value.copy(dir.normalize());
+        }
+      });
+    });
+    renderer.render(scene, camera);
+  }
+
+  // Export helpers (baking shader colors for spheres)
+  function bakeShaderColorsToGeometry(mesh) {
+    if (!mesh || !mesh.geometry) return mesh.geometry.clone();
+    const geometry = mesh.geometry;
+    const material = mesh.material;
+    if (!material || !material.uniforms || !material.uniforms.M) return geometry.clone();
+    const baked = geometry.clone();
+    const pos = baked.attributes.position, normals = baked.attributes.normal;
+    const vcount = pos.count;
+    const colors = new Float32Array(vcount*3);
+    const M = material.uniforms.M.value;
+    const lightDir = material.uniforms.lightDir.value.clone().normalize();
+    const colorComp = material.uniforms.colorComp.value;
+    const colorDilat = material.uniforms.colorDilat.value;
+    const normalMatrix = new THREE.Matrix3().getNormalMatrix(mesh.matrixWorld);
+    for (let i=0;i<vcount;i++){
+      const nx = normals.getX(i), ny = normals.getY(i), nz = normals.getZ(i);
+      const wn = new THREE.Vector3(nx,ny,nz).applyMatrix3(normalMatrix).normalize();
+      const Mu_x = M[0]*wn.x + M[1]*wn.y + M[2]*wn.z;
+      const Mu_y = M[3]*wn.x + M[4]*wn.y + M[5]*wn.z;
+      const Mu_z = M[6]*wn.x + M[7]*wn.y + M[8]*wn.z;
+      const sigma = wn.x*Mu_x + wn.y*Mu_y + wn.z*Mu_z;
+      const t = Math.max(0, Math.min(1, (sigma - (-0.00035)) / (0.00035 - (-0.00035))));
+      const smooth = t*t*(3 - 2*t);
+      const base = new THREE.Color().lerpColors(colorComp, colorDilat, smooth);
+      const L = Math.max(0, wn.dot(lightDir));
+      const shaded = base.clone().multiplyScalar(0.3 + 0.7*L);
+      colors[i*3+0] = shaded.r; colors[i*3+1] = shaded.g; colors[i*3+2] = shaded.b;
+    }
+    baked.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    return baked;
+  }
+
+  function prepareSceneForExport() {
+    const exportGroup = new THREE.Group();
+    rootGroup.children.forEach(eventGroup => {
+      const cg = new THREE.Group();
+      cg.position.copy(eventGroup.position); cg.rotation.copy(eventGroup.rotation); cg.scale.copy(eventGroup.scale); cg.updateMatrix();
+      eventGroup.children.forEach(child => {
+        if (child.geometry && child.geometry.type === 'SphereGeometry') {
+          const bakedGeom = bakeShaderColorsToGeometry(child);
+          const mat = new THREE.MeshStandardMaterial({ vertexColors:true, roughness:0.4, metalness:0.0, side:THREE.DoubleSide });
+          const mesh = new THREE.Mesh(bakedGeom, mat);
+          mesh.position.copy(child.position); mesh.rotation.copy(child.rotation); mesh.scale.copy(child.scale); mesh.updateMatrix();
+          cg.add(mesh);
+        } else if (child.geometry && child.geometry.type === 'PlaneGeometry') {
+          const pg = child.geometry.clone(); const pm = child.material.clone();
+          const plane = new THREE.Mesh(pg, pm);
+          plane.position.copy(child.position); plane.rotation.copy(child.rotation); plane.scale.copy(child.scale); plane.updateMatrix();
+          cg.add(plane);
+        } else if (child.type === 'Line') {
+          const lg = child.geometry.clone(); const lm = child.material.clone();
+          const line = new THREE.Line(lg, lm);
+          line.position.copy(child.position); line.rotation.copy(child.rotation); line.scale.copy(child.scale); line.updateMatrix();
+          cg.add(line);
+        }
+      });
+      exportGroup.add(cg);
+    });
+    if (axesGroup) exportGroup.add(axesGroup.clone());
+    return exportGroup;
+  }
+
+  function exportSceneGLB() {
+    if (rootGroup.children.length === 0) { showValidationMessage('Nessun dato da esportare. Carica prima un file CSV', false); return; }
+    const exportGroup = prepareSceneForExport();
+    const exporter = new GLTFExporter();
+    const options = { binary:true, trs:true, onlyVisible:true, truncateDrawRange:true, embedImages:true, maxTextureSize:4096 };
+    exportBtn.textContent = 'Esportazione...'; exportBtn.disabled = true;
+    exporter.parse(exportGroup, result => {
+      saveArrayBuffer(result, 'beachballs_export.glb');
+      exportBtn.textContent = 'Esporta GLB'; exportBtn.disabled = false;
+      showValidationMessage('Esportazione completata', true);
+    }, error => {
+      console.error('Errore export', error);
+      showValidationMessage('Errore durante l\'esportazione', false);
+      exportBtn.textContent = 'Esporta GLB'; exportBtn.disabled = false;
+    }, options);
+  }
+
+  function saveArrayBuffer(buffer, filename) {
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; link.click();
+    setTimeout(()=>URL.revokeObjectURL(link.href), 1500);
+  }
+
+  exportBtn.addEventListener('click', exportSceneGLB);
+
+  </script>
+</body>
+</html>
